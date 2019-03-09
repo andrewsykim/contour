@@ -19,10 +19,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 
 	clientset "github.com/heptio/contour/apis/generated/clientset/versioned"
+	contourinformers "github.com/heptio/contour/apis/generated/informers/externalversions"
 	"github.com/heptio/contour/internal/contour"
 	"github.com/heptio/contour/internal/debug"
 	"github.com/heptio/contour/internal/envoy"
@@ -34,10 +36,16 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
+	coreinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
+
+type informerFactory interface {
+	WaitForCacheSync(stopCh <-chan struct{}) map[reflect.Type]bool
+	Start(stopCh <-chan struct{})
+}
 
 var ingressrouteRootNamespaceFlag string
 
@@ -165,12 +173,15 @@ func main() {
 
 		client, contourClient := newClient(*kubeconfig, *inCluster)
 
-		wl := log.WithField("context", "watch")
-		k8s.WatchServices(&g, client, wl, &reh)
-		k8s.WatchIngress(&g, client, wl, &reh)
-		k8s.WatchSecrets(&g, client, wl, &reh)
-		k8s.WatchIngressRoutes(&g, contourClient, wl, &reh)
-		k8s.WatchTLSCertificateDelegations(&g, contourClient, wl, &reh)
+		// resync timer disabled for Contour
+		coreInformers := coreinformers.NewSharedInformerFactory(client, 0)
+		contourInformers := contourinformers.NewSharedInformerFactory(contourClient, 0)
+
+		coreInformers.Core().V1().Services().Informer().AddEventHandler(&reh)
+		coreInformers.Extensions().V1beta1().Ingresses().Informer().AddEventHandler(&reh)
+		coreInformers.Core().V1().Secrets().Informer().AddEventHandler(&reh)
+		contourInformers.Contour().V1beta1().IngressRoutes().Informer().AddEventHandler(&reh)
+		contourInformers.Contour().V1beta1().TLSCertificateDelegations().Informer().AddEventHandler(&reh)
 
 		ch.IngressRouteStatus = &k8s.IngressRouteStatus{
 			Client: contourClient,
@@ -181,7 +192,29 @@ func main() {
 		et := &contour.EndpointsTranslator{
 			FieldLogger: log.WithField("context", "endpointstranslator"),
 		}
-		k8s.WatchEndpoints(&g, client, wl, et)
+		coreInformers.Core().V1().Endpoints().Informer().AddEventHandler(et)
+
+		informerStart := func(inf informerFactory, stop <-chan struct{}, log *logrus.Entry) {
+			log.Println("waiting for cache sync")
+			inf.WaitForCacheSync(stop)
+
+			log.Println("started")
+			defer log.Println("stopping")
+			inf.Start(stop)
+			<-stop
+		}
+
+		g.Add(func(stop <-chan struct{}) error {
+			log := log.WithField("context", "coreinformers")
+			informerStart(coreInformers, stop, log)
+			return nil
+		})
+
+		g.Add(func(stop <-chan struct{}) error {
+			log := log.WithField("context", "contourinformers")
+			informerStart(contourInformers, stop, log)
+			return nil
+		})
 
 		ch.Metrics = metrics
 		reh.Metrics = metrics
