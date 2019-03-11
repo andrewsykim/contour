@@ -1,4 +1,4 @@
-# Contributing
+# Contributing hello
 
 Thanks for taking the time to join our community and start contributing. 
 These guidelines will help you get started with the Contour project.
