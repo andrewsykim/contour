@@ -42,11 +42,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-type informerFactory interface {
-	WaitForCacheSync(stopCh <-chan struct{}) map[reflect.Type]bool
-	Start(stopCh <-chan struct{})
-}
-
 var ingressrouteRootNamespaceFlag string
 
 func main() {
@@ -194,27 +189,8 @@ func main() {
 		}
 		coreInformers.Core().V1().Endpoints().Informer().AddEventHandler(et)
 
-		informerStart := func(inf informerFactory, stop <-chan struct{}, log *logrus.Entry) {
-			log.Println("waiting for cache sync")
-			inf.WaitForCacheSync(stop)
-
-			log.Println("started")
-			defer log.Println("stopping")
-			inf.Start(stop)
-			<-stop
-		}
-
-		g.Add(func(stop <-chan struct{}) error {
-			log := log.WithField("context", "coreinformers")
-			informerStart(coreInformers, stop, log)
-			return nil
-		})
-
-		g.Add(func(stop <-chan struct{}) error {
-			log := log.WithField("context", "contourinformers")
-			informerStart(contourInformers, stop, log)
-			return nil
-		})
+		g.Add(startInformer(coreInformers, log.WithField("context", "coreinformers")))
+		g.Add(startInformer(contourInformers, log.WithField("context", "contourinformers")))
 
 		ch.Metrics = metrics
 		reh.Metrics = metrics
@@ -272,6 +248,24 @@ func newClient(kubeconfig string, inCluster bool) (*kubernetes.Clientset, *clien
 	contourClient, err := clientset.NewForConfig(config)
 	check(err)
 	return client, contourClient
+}
+
+type informer interface {
+	WaitForCacheSync(stopCh <-chan struct{}) map[reflect.Type]bool
+	Start(stopCh <-chan struct{})
+}
+
+func startInformer(inf informer, log logrus.FieldLogger) func(stop <-chan struct{}) error {
+	return func(stop <-chan struct{}) error {
+		log.Println("waiting for cache sync")
+		inf.WaitForCacheSync(stop)
+
+		log.Println("started")
+		defer log.Println("stopping")
+		inf.Start(stop)
+		<-stop
+		return nil
+	}
 }
 
 func check(err error) {
